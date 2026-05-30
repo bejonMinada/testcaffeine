@@ -4,9 +4,21 @@ TestCaffeine is a Windows desktop utility that monitors real user inactivity and
 
 ## Download and run (no Python required)
 
-- Download `TestCaffeine.exe` from GitHub Releases.
+- Download the latest release asset from GitHub Releases: https://github.com/bejonMinada/testcaffeine/releases/latest
 - Run on a 64-bit Windows machine.
 - Python is not required on end-user machines because the release executable is built with PyInstaller.
+
+## Release verification
+
+- Release: https://github.com/bejonMinada/testcaffeine/releases/tag/v1.0.0
+- Asset: `TestCaffeine.exe`
+- SHA-256: `1BDDA2EF14300CC857BE95830732FE423C2BC27D0B34C0079C08C2D8980833D0`
+
+To verify on Windows:
+
+```powershell
+Get-FileHash .\TestCaffeine.exe -Algorithm SHA256
+```
 
 ## Why this is compliant
 
