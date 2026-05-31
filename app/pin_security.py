@@ -15,7 +15,8 @@ PIN_MIN_LENGTH = 4
 PIN_MAX_LENGTH = 12
 PIN_HASH_ITERATIONS = 320_000
 PIN_SALT_BYTES = 16
-LOCKOUT_SECONDS_CAP = 300
+LOCKOUT_SECONDS_CAP = 120
+MAX_BACKOFF_EXPONENT = 7
 
 
 @dataclass
@@ -139,7 +140,7 @@ class PinManager:
             return PinVerificationResult(success=True, locked=False, retry_after_seconds=0, failed_attempts=0)
 
         failed_attempts += 1
-        retry_after = min(LOCKOUT_SECONDS_CAP, 2 ** min(failed_attempts, 8))
+        retry_after = min(LOCKOUT_SECONDS_CAP, 2 ** min(failed_attempts, MAX_BACKOFF_EXPONENT))
         record["failed_attempts"] = failed_attempts
         record["last_failure_epoch"] = now
         record["lockout_until_epoch"] = now + retry_after
@@ -184,6 +185,7 @@ class PinManager:
         in_blob, in_buffer = self._to_blob(data)
         out_blob = _DATA_BLOB()
         entropy, entropy_buffer = self._to_blob(APP_NAME.encode("utf-8"))
+        keepalive = (in_buffer, entropy_buffer)
         try:
             ok = self._crypt32.CryptProtectData(
                 ctypes.byref(in_blob),
@@ -198,14 +200,14 @@ class PinManager:
                 raise ctypes.WinError(ctypes.get_last_error())
             return self._blob_to_bytes(out_blob)
         finally:
-            _ = in_buffer
-            _ = entropy_buffer
+            _ = keepalive
             self._free_blob(out_blob)
 
     def _dpapi_unprotect(self, data: bytes) -> bytes:
         in_blob, in_buffer = self._to_blob(data)
         out_blob = _DATA_BLOB()
         entropy, entropy_buffer = self._to_blob(APP_NAME.encode("utf-8"))
+        keepalive = (in_buffer, entropy_buffer)
         try:
             ok = self._crypt32.CryptUnprotectData(
                 ctypes.byref(in_blob),
@@ -220,8 +222,7 @@ class PinManager:
                 raise ctypes.WinError(ctypes.get_last_error())
             return self._blob_to_bytes(out_blob)
         finally:
-            _ = in_buffer
-            _ = entropy_buffer
+            _ = keepalive
             self._free_blob(out_blob)
 
     def _get_boot_marker(self) -> int:

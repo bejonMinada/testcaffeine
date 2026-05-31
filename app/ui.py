@@ -8,16 +8,15 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 from .config import (
     DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
     MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS,
     MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-    MAX_IDLE_TIMEOUT_SECONDS,
     MAX_LOW_BATTERY_THRESHOLD_PERCENT,
     MAX_MAX_AWAKE_SESSION_HOURS,
     MIN_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-    MIN_IDLE_TIMEOUT_SECONDS,
     MIN_LOW_BATTERY_THRESHOLD_PERCENT,
     MIN_MAX_AWAKE_SESSION_HOURS,
     get_app_data_dir,
@@ -103,9 +102,6 @@ class TestCaffeineApp:
         self.root.configure(bg="#f5efe8")
 
         self.settings = load_settings()
-        self.settings.auto_focus_overlay_on_idle = True
-        self.settings.idle_timeout_seconds = MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS
-        self.settings.focus_overlay_blackout_delay_seconds = DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
         self.settings.auto_start_with_windows = is_auto_start_enabled()
         self.logger = build_logger()
         self.security_events = SecurityEventSink(enabled=self.settings.security_events_enabled)
@@ -118,6 +114,7 @@ class TestCaffeineApp:
         self._focus_overlay: tk.Toplevel | None = None
         self._focus_overlay_hint: tk.Frame | None = None
         self._focus_overlay_blackout_job: str | None = None
+        self._focus_overlay_recreate_job: str | None = None
         self._focus_overlay_blackout_active = False
         self._focus_overlay_active = False
         self._focus_overlay_auto_engaged = False
@@ -340,7 +337,7 @@ class TestCaffeineApp:
         )
         ttk.Label(
             card,
-            text="Focus Privacy Screen helps hide content while idle; it is not a full device lock.",
+            text="Focus privacy screen helps hide content while idle; it is not a full device lock.",
             style="Body.TLabel",
             name="subtitle_label",
         ).grid(row=1, column=1, pady=(2, 16), sticky="w")
@@ -574,6 +571,7 @@ class TestCaffeineApp:
         return self._open_pin_setup_dialog()
 
     def _enable_focus_overlay(self, auto: bool) -> None:
+        # Forced-close handling may briefly leave the active flag set while recreating the overlay.
         if self._focus_overlay_active and self._focus_overlay is not None:
             self._focus_overlay_auto_engaged = auto
             return
@@ -679,6 +677,12 @@ class TestCaffeineApp:
         self._focus_overlay_hint = None
         self._focus_unlock_entry = None
         self._focus_unlock_feedback_var.set("")
+        if self._focus_overlay_recreate_job is not None:
+            try:
+                self.root.after_cancel(self._focus_overlay_recreate_job)
+            except tk.TclError:
+                pass
+            self._focus_overlay_recreate_job = None
         self._focus_overlay_blackout_active = False
         if hasattr(self, "focus_btn"):
             self.focus_btn.configure(text="👁")
@@ -713,10 +717,10 @@ class TestCaffeineApp:
             failed_attempts=result.failed_attempts,
             retry_after_seconds=result.retry_after_seconds,
         )
-        self.root.after(max(1000, result.retry_after_seconds * 1000), self._refresh_unlock_feedback)
+        self.root.after(result.retry_after_seconds * 1000, self._refresh_unlock_feedback)
 
     def _refresh_unlock_feedback(self) -> None:
-        if self._focus_overlay_active:
+        if self._focus_overlay_active and self._focus_overlay is not None:
             self._focus_unlock_feedback_var.set("Enter PIN to unlock.")
 
     def _refocus_overlay(self) -> None:
@@ -737,7 +741,20 @@ class TestCaffeineApp:
         self._focus_overlay = None
         self._focus_overlay_hint = None
         self._focus_unlock_entry = None
-        self.root.after(120, lambda: self._enable_focus_overlay(auto=self._focus_overlay_auto_engaged))
+        if self._focus_overlay_recreate_job is not None:
+            try:
+                self.root.after_cancel(self._focus_overlay_recreate_job)
+            except tk.TclError:
+                pass
+        self._focus_overlay_recreate_job = self.root.after(
+            120,
+            lambda: self._recreate_focus_overlay(),
+        )
+
+    def _recreate_focus_overlay(self) -> None:
+        self._focus_overlay_recreate_job = None
+        if self._focus_overlay_active and self.monitor.state != MonitorState.STOPPED:
+            self._enable_focus_overlay(auto=self._focus_overlay_auto_engaged)
 
     def _schedule_focus_blackout(self) -> None:
         if self._focus_overlay is None:
@@ -838,7 +855,7 @@ class TestCaffeineApp:
     def _open_pin_dialog(
         self,
         title: str,
-        apply_pin: callable,
+        apply_pin: Callable[[str, str, str], None],
         require_current: bool,
         include_identity_confirmation: bool = False,
     ) -> bool:
@@ -939,7 +956,6 @@ class TestCaffeineApp:
         frame = ttk.Frame(dialog, style="Card.TFrame", padding=16, name="preferences_frame")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        timeout_var = tk.IntVar(value=self.settings.idle_timeout_seconds)
         max_awake_hours_var = tk.IntVar(value=self.settings.max_awake_session_hours)
         allow_indefinite_awake_var = tk.BooleanVar(value=self.settings.allow_indefinite_awake)
         disable_on_battery_var = tk.BooleanVar(value=self.settings.disable_on_battery)
@@ -951,18 +967,12 @@ class TestCaffeineApp:
         ttk.Label(frame, text="Idle timeout (seconds)", style="Body.TLabel", name="idle_timeout_label").grid(
             row=0, column=0, sticky="w"
         )
-        idle_timeout_spin = ttk.Spinbox(
+        ttk.Label(
             frame,
             name="idle_timeout_spinbox",
-            from_=MIN_IDLE_TIMEOUT_SECONDS,
-            to=MAX_IDLE_TIMEOUT_SECONDS,
-            textvariable=timeout_var,
-            width=8,
-            style="Flat.TSpinbox",
-            justify="center",
-        )
-        idle_timeout_spin.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        idle_timeout_spin.state(["disabled"])
+            text=str(MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS),
+            style="Value.TLabel",
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
 
         ttk.Label(frame, text="Max awake session (hours)", style="Body.TLabel", name="max_awake_label").grid(
             row=1, column=0, sticky="w", pady=(10, 0)
@@ -1062,7 +1072,6 @@ class TestCaffeineApp:
 
         def save_and_close() -> None:
             self._save_settings_values(
-                idle_timeout_seconds=timeout_var.get(),
                 max_awake_session_hours=max_awake_hours_var.get(),
                 allow_indefinite_awake=allow_indefinite_awake_var.get(),
                 disable_on_battery=disable_on_battery_var.get(),
@@ -1293,7 +1302,6 @@ class TestCaffeineApp:
 
     def _save_settings_values(
         self,
-        idle_timeout_seconds: int,
         max_awake_session_hours: int,
         allow_indefinite_awake: bool,
         disable_on_battery: bool,
@@ -1303,7 +1311,6 @@ class TestCaffeineApp:
         minimize_to_tray: bool,
         silent: bool,
     ) -> None:
-        _ = idle_timeout_seconds
         timeout = MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS
         max_awake_hours = max(
             MIN_MAX_AWAKE_SESSION_HOURS,
