@@ -10,6 +10,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .config import (
+    DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
+    MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS,
     MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
     MAX_IDLE_TIMEOUT_SECONDS,
     MAX_LOW_BATTERY_THRESHOLD_PERCENT,
@@ -25,6 +27,7 @@ from .config import (
 )
 from .logging_setup import build_logger
 from .monitor import IdleMonitor, MonitorCallbacks, MonitorState
+from .pin_security import PIN_MAX_LENGTH, PIN_MIN_LENGTH, PinManager
 from .security_events import SecurityEventSink
 from .startup import is_auto_start_enabled, set_auto_start
 from .tray_icon import WinTrayIcon
@@ -100,9 +103,13 @@ class TestCaffeineApp:
         self.root.configure(bg="#f5efe8")
 
         self.settings = load_settings()
+        self.settings.auto_focus_overlay_on_idle = True
+        self.settings.idle_timeout_seconds = MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS
+        self.settings.focus_overlay_blackout_delay_seconds = DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
         self.settings.auto_start_with_windows = is_auto_start_enabled()
         self.logger = build_logger()
         self.security_events = SecurityEventSink(enabled=self.settings.security_events_enabled)
+        self.pin_manager = PinManager()
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._is_hidden = False
         self._is_exiting = False
@@ -114,6 +121,8 @@ class TestCaffeineApp:
         self._focus_overlay_blackout_active = False
         self._focus_overlay_active = False
         self._focus_overlay_auto_engaged = False
+        self._focus_unlock_feedback_var = tk.StringVar(value="")
+        self._focus_unlock_entry: ttk.Entry | None = None
         self.tray_icon: WinTrayIcon | None = None
         self.widget_ids: dict[str, str] = {
             "main_menubar": "main_menubar",
@@ -148,9 +157,6 @@ class TestCaffeineApp:
             "low_battery_threshold_spinbox": "low_battery_threshold_spinbox",
             "auto_start_checkbutton": "auto_start_checkbutton",
             "minimize_to_tray_checkbutton": "minimize_to_tray_checkbutton",
-            "auto_focus_overlay_checkbutton": "auto_focus_overlay_checkbutton",
-            "focus_blackout_delay_label": "focus_blackout_delay_label",
-            "focus_blackout_delay_spinbox": "focus_blackout_delay_spinbox",
             "preferences_controls_frame": "preferences_controls_frame",
             "preferences_cancel_button": "preferences_cancel_button",
             "preferences_save_button": "preferences_save_button",
@@ -274,6 +280,8 @@ class TestCaffeineApp:
             "file_export_diagnostics": "File>Export Diagnostics",
             "file_exit": "File>Exit",
             "settings_preferences": "Settings>Preferences",
+            "settings_change_pin": "Settings>Change Focus PIN",
+            "settings_recover_pin": "Settings>Recover Focus PIN",
             "help_about": "Help>About",
         }
 
@@ -290,6 +298,12 @@ class TestCaffeineApp:
 
         settings_menu = tk.Menu(menubar, tearoff=0, name="settings_menu")
         settings_menu.add_command(label="Preferences", command=self._open_settings_dialog)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Change Focus PIN", command=self._open_change_pin_dialog)
+        settings_menu.add_command(
+            label="Recover Focus PIN (after reboot)",
+            command=self._open_recover_pin_dialog,
+        )
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0, name="help_menu")
@@ -326,7 +340,7 @@ class TestCaffeineApp:
         )
         ttk.Label(
             card,
-            text="Brew focus, not sleep - your tiny espresso shot for marathon test runs.",
+            text="Focus Privacy Screen helps hide content while idle; it is not a full device lock.",
             style="Body.TLabel",
             name="subtitle_label",
         ).grid(row=1, column=1, pady=(2, 16), sticky="w")
@@ -524,7 +538,8 @@ class TestCaffeineApp:
             "About TestCaffeine",
             "TestCaffeine\n\n"
             "Windows wake-control utility for long automation runs.\n"
-            "Uses Windows power APIs without input simulation.",
+            "Uses Windows power APIs without input simulation.\n"
+            "Focus privacy mode is an app-layer privacy aid, not a replacement for Windows lock policies.",
         )
 
     def _toggle_focus_overlay(self) -> None:
@@ -532,9 +547,9 @@ class TestCaffeineApp:
             self._append_log("Start monitoring to enable focus mode")
             return
         if self._focus_overlay_active:
-            self._disable_focus_overlay()
-        else:
-            self._enable_focus_overlay(auto=False)
+            self._append_log("Focus privacy screen cannot be disabled while monitoring is active")
+            return
+        self._enable_focus_overlay(auto=False)
 
     def _get_action_button_tooltip_text(self) -> str:
         if self.monitor.state == MonitorState.STOPPED:
@@ -545,17 +560,28 @@ class TestCaffeineApp:
         if self.monitor.state == MonitorState.STOPPED:
             return "Focus mode is available only while monitoring is running."
         if self._focus_overlay_active:
-            return "Disable the full-screen focus overlay."
-        return "Enable the full-screen focus overlay."
+            return "Focus privacy screen is active and cannot be disabled during monitoring."
+        return "Enable the full-screen focus privacy screen."
+
+    def _ensure_pin_setup(self) -> bool:
+        if self.pin_manager.is_configured():
+            return True
+        self.security_events.emit("focus_pin_setup_required", severity="warning")
+        messagebox.showinfo(
+            "Set Focus PIN",
+            f"Focus privacy mode requires a {PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digit PIN before monitoring starts.",
+        )
+        return self._open_pin_setup_dialog()
 
     def _enable_focus_overlay(self, auto: bool) -> None:
-        if self._focus_overlay_active:
+        if self._focus_overlay_active and self._focus_overlay is not None:
             self._focus_overlay_auto_engaged = auto
             return
 
         overlay = tk.Toplevel(self.root, name="focus_overlay")
         overlay.overrideredirect(True)
         overlay.attributes("-topmost", True)
+        overlay.protocol("WM_DELETE_WINDOW", lambda: self._on_focus_overlay_forced_close("window_close"))
         try:
             overlay.attributes("-fullscreen", True)
         except tk.TclError:
@@ -571,25 +597,37 @@ class TestCaffeineApp:
         hint = tk.Frame(overlay, bg="#111111", bd=1, relief="solid", name="focus_overlay_hint")
         prompt = tk.Label(
             hint,
-            text="Focus mode active\nPress Ctrl+Space, the Windows key, or shortcut combos (e.g., Alt+Tab, Alt+F4) to exit",
+            text="Focus privacy screen active\nThis helps hide app content while idle and is not a full OS lock.\nEnter your PIN to unlock.",
             bg="#111111",
             fg="#e6e6e6",
             font=("Calibri", 11),
             justify="center",
             name="focus_overlay_prompt",
         )
-        prompt.pack(padx=14, pady=(10, 4))
-        unlock = tk.Label(
+        prompt.pack(padx=14, pady=(10, 8))
+
+        entry = ttk.Entry(hint, width=20, show="*", justify="center")
+        entry.pack(padx=14, pady=(0, 6))
+        entry.focus_force()
+        self._focus_unlock_entry = entry
+        self._focus_unlock_feedback_var.set("")
+        feedback = tk.Label(
             hint,
-            text="Click here to unlock",
+            textvariable=self._focus_unlock_feedback_var,
             bg="#111111",
-            fg="#8fd3ff",
-            font=("Calibri Bold", 11),
-            cursor="hand2",
-            name="focus_overlay_unlock_label",
+            fg="#ffcc8b",
+            font=("Calibri", 10),
+            justify="center",
+            name="focus_overlay_feedback_label",
         )
-        unlock.pack(padx=14, pady=(2, 10))
-        unlock.bind("<Button-1>", lambda _e: self._disable_focus_overlay())
+        feedback.pack(padx=14, pady=(2, 8))
+        unlock_btn = ttk.Button(
+            hint,
+            text="Unlock with PIN",
+            style="Secondary.TButton",
+            command=self._attempt_focus_unlock,
+        )
+        unlock_btn.pack(padx=14, pady=(0, 10))
 
         def show_hint(_event: tk.Event) -> None:
             if self._focus_overlay_blackout_active:
@@ -597,43 +635,17 @@ class TestCaffeineApp:
             hint.place(relx=0.5, rely=0.5, anchor="center")
 
         def on_overlay_destroyed(_event: tk.Event) -> None:
-            # Fires when the overlay is closed externally (Alt+F4, task manager, etc.)
-            # Guard: only act if we still think focus mode is active.
             if self._focus_overlay_active:
-                self._focus_overlay = None  # already destroyed — prevent double-destroy
-                self._focus_overlay_hint = None
-                self._disable_focus_overlay()
-
-        def emergency_unlock(_event: tk.Event) -> None:
-            self._disable_focus_overlay()
+                self._on_focus_overlay_forced_close("destroyed")
 
         def on_overlay_focus_out(_event: tk.Event) -> None:
-            # If focus leaves the overlay via system shortcuts (Alt+Tab / Win+Tab),
-            # treat it as an intentional unlock.
-            def unlock_if_focus_left_overlay() -> None:
-                overlay_widget = self._focus_overlay
-                if not self._focus_overlay_active or overlay_widget is None:
-                    return
-                try:
-                    focused_widget = overlay_widget.focus_displayof()
-                except tk.TclError:
-                    focused_widget = None
-                if focused_widget is None:
-                    self._disable_focus_overlay()
-                    return
-                try:
-                    if focused_widget.winfo_toplevel() is not overlay_widget:
-                        self._disable_focus_overlay()
-                except tk.TclError:
-                    self._disable_focus_overlay()
-
-            self.root.after(120, unlock_if_focus_left_overlay)
+            self.security_events.emit("focus_lock_focus_lost", severity="warning")
+            self.root.after(80, self._refocus_overlay)
 
         overlay.bind("<Motion>", show_hint)
         overlay.bind("<Key>", show_hint)
-        overlay.bind("<Control-space>", lambda _e: self._disable_focus_overlay())
-        overlay.bind("<Control-Shift-Escape>", emergency_unlock)
-        overlay.bind("<Control-Alt-Delete>", emergency_unlock)
+        overlay.bind("<Return>", lambda _e: self._attempt_focus_unlock())
+        overlay.bind("<Alt-F4>", lambda _e: "break")
         overlay.bind("<Button-1>", show_hint)
         overlay.bind("<FocusOut>", on_overlay_focus_out)
         overlay.bind("<Destroy>", on_overlay_destroyed)
@@ -648,7 +660,8 @@ class TestCaffeineApp:
         self._focus_overlay_blackout_active = False
         self._set_focus_overlay_transparent(schedule_blackout=False)
         self.focus_btn.configure(text="👁")
-        self._append_log("Focus screen enabled")
+        self._append_log("Focus privacy screen enabled")
+        self.security_events.emit("focus_lock_engaged", auto=auto)
 
     def _disable_focus_overlay(self) -> None:
         if not self._focus_overlay_active and self._focus_overlay is None:
@@ -664,10 +677,67 @@ class TestCaffeineApp:
                 pass
         self._focus_overlay = None
         self._focus_overlay_hint = None
+        self._focus_unlock_entry = None
+        self._focus_unlock_feedback_var.set("")
         self._focus_overlay_blackout_active = False
         if hasattr(self, "focus_btn"):
             self.focus_btn.configure(text="👁")
-        self._append_log("Focus screen disabled")
+        self._append_log("Focus privacy screen disabled")
+        self.security_events.emit("focus_lock_disengaged")
+
+    def _attempt_focus_unlock(self) -> None:
+        if self._focus_unlock_entry is None:
+            return
+        entered_pin = self._focus_unlock_entry.get()
+        self.security_events.emit("focus_unlock_attempt")
+        try:
+            result = self.pin_manager.verify_pin(entered_pin)
+        except ValueError as exc:
+            self._focus_unlock_feedback_var.set(str(exc))
+            self.security_events.emit("focus_unlock_error", severity="warning", error=str(exc))
+            return
+
+        if result.success:
+            self.security_events.emit("focus_unlock_success")
+            self._disable_focus_overlay()
+            return
+
+        self._focus_unlock_entry.delete(0, tk.END)
+        self._focus_unlock_feedback_var.set(
+            f"Invalid PIN. Retry in {result.retry_after_seconds}s (attempts: {result.failed_attempts})."
+        )
+        severity = "warning" if result.failed_attempts < 4 else "error"
+        self.security_events.emit(
+            "focus_unlock_failed",
+            severity=severity,
+            failed_attempts=result.failed_attempts,
+            retry_after_seconds=result.retry_after_seconds,
+        )
+        self.root.after(max(1000, result.retry_after_seconds * 1000), self._refresh_unlock_feedback)
+
+    def _refresh_unlock_feedback(self) -> None:
+        if self._focus_overlay_active:
+            self._focus_unlock_feedback_var.set("Enter PIN to unlock.")
+
+    def _refocus_overlay(self) -> None:
+        if not self._focus_overlay_active or self._focus_overlay is None:
+            return
+        try:
+            self._focus_overlay.attributes("-topmost", True)
+            self._focus_overlay.lift()
+            self._focus_overlay.focus_force()
+        except tk.TclError:
+            pass
+
+    def _on_focus_overlay_forced_close(self, reason: str) -> None:
+        if not self._focus_overlay_active:
+            return
+        self.security_events.emit("focus_lock_forced_close_attempt", severity="error", reason=reason)
+        self._append_log("Focus privacy screen close attempt blocked")
+        self._focus_overlay = None
+        self._focus_overlay_hint = None
+        self._focus_unlock_entry = None
+        self.root.after(120, lambda: self._enable_focus_overlay(auto=self._focus_overlay_auto_engaged))
 
     def _schedule_focus_blackout(self) -> None:
         if self._focus_overlay is None:
@@ -725,7 +795,137 @@ class TestCaffeineApp:
         except tk.TclError:
             pass
         self._focus_overlay_blackout_active = True
-        self._append_log("Focus screen switched to blackout mode")
+        self._append_log("Focus privacy screen switched to blackout mode")
+
+    def _open_pin_setup_dialog(self) -> bool:
+        return self._open_pin_dialog(
+            title="Set Focus PIN",
+            apply_pin=lambda _current, new, _username: self.pin_manager.set_new_pin(new),
+            require_current=False,
+        )
+
+    def _open_change_pin_dialog(self) -> bool:
+        return self._open_pin_dialog(
+            title="Change Focus PIN",
+            apply_pin=lambda current, new, _username: self._change_existing_pin(current, new),
+            require_current=True,
+        )
+
+    def _change_existing_pin(self, current_pin: str, new_pin: str) -> None:
+        result = self.pin_manager.change_pin(current_pin, new_pin)
+        if not result.success:
+            raise ValueError(
+                f"Current PIN verification failed. Retry in {result.retry_after_seconds}s."
+            )
+
+    def _open_recover_pin_dialog(self) -> bool:
+        if not self.pin_manager.can_recover_after_reboot():
+            messagebox.showerror(
+                "Recovery not available",
+                "PIN recovery is disabled in the current session. Restart Windows, sign in, and try again.",
+            )
+            return False
+        return self._open_pin_dialog(
+            title="Recover Focus PIN",
+            apply_pin=lambda _current, new, username: self.pin_manager.recover_pin_after_reboot(
+                windows_username=username,
+                new_pin=new,
+            ),
+            require_current=False,
+            include_identity_confirmation=True,
+        )
+
+    def _open_pin_dialog(
+        self,
+        title: str,
+        apply_pin: callable,
+        require_current: bool,
+        include_identity_confirmation: bool = False,
+    ) -> bool:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.configure(bg="#fff8f2")
+        dialog.grab_set()
+        dialog.focus_force()
+
+        frame = ttk.Frame(dialog, style="Card.TFrame", padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+        current_var = tk.StringVar(value="")
+        if require_current:
+            ttk.Label(frame, text="Current PIN", style="Body.TLabel").grid(row=row, column=0, sticky="w")
+            ttk.Entry(frame, textvariable=current_var, show="*", width=24).grid(
+                row=row,
+                column=1,
+                sticky="w",
+                padx=(10, 0),
+            )
+            row += 1
+
+        username_var = tk.StringVar(value="")
+        if include_identity_confirmation:
+            ttk.Label(frame, text="Windows username", style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=(8, 0))
+            ttk.Entry(frame, textvariable=username_var, width=24).grid(
+                row=row,
+                column=1,
+                sticky="w",
+                padx=(10, 0),
+                pady=(8, 0),
+            )
+            row += 1
+
+        new_var = tk.StringVar(value="")
+        confirm_var = tk.StringVar(value="")
+        ttk.Label(frame, text=f"New PIN ({PIN_MIN_LENGTH}-{PIN_MAX_LENGTH} digits)", style="Body.TLabel").grid(
+            row=row, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(frame, textvariable=new_var, show="*", width=24).grid(
+            row=row, column=1, sticky="w", padx=(10, 0), pady=(8, 0)
+        )
+        row += 1
+        ttk.Label(frame, text="Confirm PIN", style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(frame, textvariable=confirm_var, show="*", width=24).grid(
+            row=row, column=1, sticky="w", padx=(10, 0), pady=(8, 0)
+        )
+        row += 1
+
+        feedback_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=feedback_var, style="Body.TLabel").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        row += 1
+
+        action_frame = ttk.Frame(frame, style="Card.TFrame")
+        action_frame.grid(row=row, column=0, columnspan=2, sticky="e", pady=(14, 0))
+
+        success = {"value": False}
+
+        def on_save() -> None:
+            current_pin = current_var.get()
+            new_pin = new_var.get()
+            confirm_pin = confirm_var.get()
+            if new_pin != confirm_pin:
+                feedback_var.set("PIN values do not match.")
+                return
+            try:
+                apply_pin(current_pin, new_pin, username_var.get())
+            except Exception as exc:
+                feedback_var.set(str(exc))
+                return
+            success["value"] = True
+            self.security_events.emit("focus_pin_updated", mode=title.lower().replace(" ", "_"))
+            dialog.destroy()
+
+        ttk.Button(action_frame, text="Cancel", style="Secondary.TButton", command=dialog.destroy).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Button(action_frame, text="Save PIN", style="Primary.TButton", command=on_save).grid(row=0, column=1)
+
+        self.root.wait_window(dialog)
+        return bool(success["value"])
 
     def _open_settings_dialog(self) -> None:
         # Ensure preferences are visible when opened from tray while the main window is hidden.
@@ -747,13 +947,11 @@ class TestCaffeineApp:
         low_battery_threshold_var = tk.IntVar(value=self.settings.low_battery_threshold_percent)
         auto_start_var = tk.BooleanVar(value=self.settings.auto_start_with_windows)
         minimize_to_tray_var = tk.BooleanVar(value=self.settings.minimize_to_tray)
-        auto_focus_overlay_var = tk.BooleanVar(value=self.settings.auto_focus_overlay_on_idle)
-        focus_blackout_delay_var = tk.IntVar(value=self.settings.focus_overlay_blackout_delay_seconds)
 
         ttk.Label(frame, text="Idle timeout (seconds)", style="Body.TLabel", name="idle_timeout_label").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Spinbox(
+        idle_timeout_spin = ttk.Spinbox(
             frame,
             name="idle_timeout_spinbox",
             from_=MIN_IDLE_TIMEOUT_SECONDS,
@@ -762,7 +960,9 @@ class TestCaffeineApp:
             width=8,
             style="Flat.TSpinbox",
             justify="center",
-        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        )
+        idle_timeout_spin.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        idle_timeout_spin.state(["disabled"])
 
         ttk.Label(frame, text="Max awake session (hours)", style="Body.TLabel", name="max_awake_label").grid(
             row=1, column=0, sticky="w", pady=(10, 0)
@@ -829,29 +1029,18 @@ class TestCaffeineApp:
             variable=minimize_to_tray_var,
         ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        ttk.Checkbutton(
+        ttk.Label(
             frame,
-            name="auto_focus_overlay_checkbutton",
-            text="Auto-enable focus screen during idle",
-            variable=auto_focus_overlay_var,
+            text=f"Focus privacy lock idle timeout: {MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS} seconds (always on)",
+            style="Body.TLabel",
+            name="focus_blackout_delay_label",
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(
             frame,
-            text="Focus blackout delay (seconds)",
+            text=f"Focus blackout delay: {DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS} seconds (managed by policy)",
             style="Body.TLabel",
-            name="focus_blackout_delay_label",
-        ).grid(row=9, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(
-            frame,
-            name="focus_blackout_delay_spinbox",
-            from_=MIN_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-            to=MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-            textvariable=focus_blackout_delay_var,
-            width=8,
-            style="Flat.TSpinbox",
-            justify="center",
-        ).grid(row=9, column=1, sticky="w", padx=(10, 0), pady=(8, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         def refresh_dependent_controls() -> None:
             if allow_indefinite_awake_var.get():
@@ -881,8 +1070,6 @@ class TestCaffeineApp:
                 low_battery_threshold_percent=low_battery_threshold_var.get(),
                 auto_start_with_windows=auto_start_var.get(),
                 minimize_to_tray=minimize_to_tray_var.get(),
-                auto_focus_overlay_on_idle=auto_focus_overlay_var.get(),
-                focus_overlay_blackout_delay_seconds=focus_blackout_delay_var.get(),
                 silent=False,
             )
             dialog.destroy()
@@ -990,13 +1177,9 @@ class TestCaffeineApp:
         if self.tray_icon:
             self.tray_icon.set_running(state != MonitorState.STOPPED)
 
-        if self.settings.auto_focus_overlay_on_idle and not is_stopped:
-            if state in (MonitorState.KEEPING_AWAKE, MonitorState.POLICY_BLOCKED):
-                if not self._focus_overlay_active:
-                    self._enable_focus_overlay(auto=True)
-            elif state == MonitorState.STOPPED and self._focus_overlay_active and self._focus_overlay_auto_engaged:
-                # Only auto-disable when monitoring stops, not when the user simply becomes active.
-                self._disable_focus_overlay()
+        if not is_stopped and state in (MonitorState.KEEPING_AWAKE, MonitorState.POLICY_BLOCKED):
+            if not self._focus_overlay_active:
+                self._enable_focus_overlay(auto=True)
         elif state == MonitorState.STOPPED and self._focus_overlay_active and self._focus_overlay_auto_engaged:
             self._disable_focus_overlay()
 
@@ -1079,6 +1262,17 @@ class TestCaffeineApp:
             self._stop_monitoring()
 
     def _start_monitoring(self) -> None:
+        if not self._ensure_pin_setup():
+            self._append_log("Monitoring start canceled: focus PIN setup is required")
+            return
+        self.security_events.emit(
+            "focus_lock_platform_limitations",
+            severity="warning",
+            message=(
+                "System-level shortcuts like Ctrl+Alt+Del and Alt+Tab cannot be fully blocked "
+                "without kiosk mode or managed device policy."
+            ),
+        )
         if self.monitor.state == MonitorState.STOPPED:
             self._countdown_started_at = time.monotonic()
             if self.settings.allow_indefinite_awake:
@@ -1107,11 +1301,10 @@ class TestCaffeineApp:
         low_battery_threshold_percent: int,
         auto_start_with_windows: bool,
         minimize_to_tray: bool,
-        auto_focus_overlay_on_idle: bool,
-        focus_overlay_blackout_delay_seconds: int,
         silent: bool,
     ) -> None:
-        timeout = max(MIN_IDLE_TIMEOUT_SECONDS, min(int(idle_timeout_seconds), MAX_IDLE_TIMEOUT_SECONDS))
+        _ = idle_timeout_seconds
+        timeout = MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS
         max_awake_hours = max(
             MIN_MAX_AWAKE_SESSION_HOURS,
             min(int(max_awake_session_hours), MAX_MAX_AWAKE_SESSION_HOURS),
@@ -1120,10 +1313,7 @@ class TestCaffeineApp:
             MIN_LOW_BATTERY_THRESHOLD_PERCENT,
             min(int(low_battery_threshold_percent), MAX_LOW_BATTERY_THRESHOLD_PERCENT),
         )
-        blackout_delay = max(
-            MIN_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-            min(int(focus_overlay_blackout_delay_seconds), MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS),
-        )
+        blackout_delay = DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
 
         self.settings.idle_timeout_seconds = timeout
         self.settings.max_awake_session_hours = max_awake_hours
@@ -1133,7 +1323,7 @@ class TestCaffeineApp:
         self.settings.low_battery_threshold_percent = low_battery_threshold
         self.settings.auto_start_with_windows = bool(auto_start_with_windows)
         self.settings.minimize_to_tray = bool(minimize_to_tray)
-        self.settings.auto_focus_overlay_on_idle = bool(auto_focus_overlay_on_idle)
+        self.settings.auto_focus_overlay_on_idle = True
         self.settings.focus_overlay_blackout_delay_seconds = blackout_delay
         if (
             self._focus_overlay_active
@@ -1160,18 +1350,17 @@ class TestCaffeineApp:
         if not silent:
             awake_policy = "indefinite" if self.settings.allow_indefinite_awake else f"{max_awake_hours}h"
             self._append_log(
-                "Settings saved: timeout={}s, max awake={}, low battery={}%, auto-start={}, tray={}, auto-focus-overlay={}, focus-blackout-delay={}s".format(
+                "Settings saved: timeout={}s, max awake={}, low battery={}%, auto-start={}, tray={}, focus-blackout-delay={}s".format(
                     timeout,
                     awake_policy,
                     low_battery_threshold,
                     self.settings.auto_start_with_windows,
                     self.settings.minimize_to_tray,
-                    self.settings.auto_focus_overlay_on_idle,
                     self.settings.focus_overlay_blackout_delay_seconds,
                 )
             )
             self.logger.info(
-                "Settings updated: timeout=%s max_awake_hours=%s allow_indefinite_awake=%s disable_on_battery=%s pause_on_low_battery=%s low_battery_threshold=%s auto_start=%s minimize_to_tray=%s auto_focus_overlay_on_idle=%s focus_overlay_blackout_delay_seconds=%s",
+                "Settings updated: timeout=%s max_awake_hours=%s allow_indefinite_awake=%s disable_on_battery=%s pause_on_low_battery=%s low_battery_threshold=%s auto_start=%s minimize_to_tray=%s focus_overlay_blackout_delay_seconds=%s",
                 timeout,
                 max_awake_hours,
                 self.settings.allow_indefinite_awake,
@@ -1180,7 +1369,6 @@ class TestCaffeineApp:
                 self.settings.low_battery_threshold_percent,
                 self.settings.auto_start_with_windows,
                 self.settings.minimize_to_tray,
-                self.settings.auto_focus_overlay_on_idle,
                 self.settings.focus_overlay_blackout_delay_seconds,
             )
             self.security_events.emit(
@@ -1193,7 +1381,6 @@ class TestCaffeineApp:
                 low_battery_threshold_percent=self.settings.low_battery_threshold_percent,
                 auto_start_with_windows=self.settings.auto_start_with_windows,
                 minimize_to_tray=self.settings.minimize_to_tray,
-                auto_focus_overlay_on_idle=self.settings.auto_focus_overlay_on_idle,
                 focus_overlay_blackout_delay_seconds=self.settings.focus_overlay_blackout_delay_seconds,
             )
 
@@ -1232,4 +1419,3 @@ def run_app() -> None:
     app = TestCaffeineApp(root)
     app._append_log("Application ready")
     root.mainloop()
-

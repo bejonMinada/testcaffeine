@@ -17,7 +17,7 @@ TestCaffeine is a Windows desktop utility that monitors real user inactivity and
 
 ## Features
 
-- Configurable inactivity timeout (default: 30 seconds).
+- Mandatory inactivity timeout for focus privacy lock (30 seconds).
 - Configurable max awake session guardrail (default: 2 hours).
 - Optional indefinite awake mode for long unattended runs.
 - Optional policy to block wake assertions when device is on battery.
@@ -25,6 +25,10 @@ TestCaffeine is a Windows desktop utility that monitors real user inactivity and
 - Optional auto-start with Windows (current user).
 - Optional minimize-to-tray behavior with tray menu controls.
 - Diagnostics export to ZIP (settings + logs + security events).
+- Mandatory focus privacy lock during idle (cannot be disabled while monitoring).
+- Mandatory PIN-based unlock for the focus privacy lock.
+- PIN retry cooldown with exponential backoff and lockout telemetry.
+- Recovery PIN reset flow only after full device reboot and identity confirmation.
 - First-run setup wizard for auto-start, tray mode, and battery safeguards.
 - Minimal Tkinter UI to start/stop monitoring.
 - Single-instance protection (prevents launching multiple independent app instances).
@@ -86,3 +90,6 @@ Apache-2.0 (recommended for business-friendly open-source distribution).
 
 - This tool is Windows-only.
 - Some organization lock policies may still enforce lock behavior regardless of power assertion.
+- Focus privacy lock is an application-layer control, not a full Windows security boundary.
+- Windows secure/system shortcuts (for example Ctrl+Alt+Del) cannot be fully blocked by a normal user-mode app.
+- For hard shortcut restrictions, use managed kiosk mode and Group Policy/MDM controls.

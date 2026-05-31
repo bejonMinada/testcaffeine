@@ -14,9 +14,10 @@ DEFAULT_LOW_BATTERY_THRESHOLD_PERCENT = 20
 DEFAULT_SECURITY_EVENTS_ENABLED = True
 DEFAULT_AUTO_START_WITH_WINDOWS = False
 DEFAULT_MINIMIZE_TO_TRAY = True
-DEFAULT_AUTO_FOCUS_OVERLAY_ON_IDLE = False
-DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS = 30
+DEFAULT_AUTO_FOCUS_OVERLAY_ON_IDLE = True
+DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS = 15
 DEFAULT_ONBOARDING_COMPLETED = False
+MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS = 30
 
 MIN_IDLE_TIMEOUT_SECONDS = 5
 MAX_IDLE_TIMEOUT_SECONDS = 3600
@@ -100,12 +101,7 @@ def load_settings() -> AppSettings:
     )
     auto_start_with_windows = raw.get("auto_start_with_windows", DEFAULT_AUTO_START_WITH_WINDOWS)
     minimize_to_tray = raw.get("minimize_to_tray", DEFAULT_MINIMIZE_TO_TRAY)
-    auto_focus_overlay_on_idle = raw.get(
-        "auto_focus_overlay_on_idle", DEFAULT_AUTO_FOCUS_OVERLAY_ON_IDLE
-    )
-    focus_overlay_blackout_delay_seconds = raw.get(
-        "focus_overlay_blackout_delay_seconds", DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
-    )
+    auto_focus_overlay_on_idle = True
     onboarding_completed = raw.get("onboarding_completed", DEFAULT_ONBOARDING_COMPLETED)
 
     try:
@@ -135,13 +131,11 @@ def load_settings() -> AppSettings:
     except (TypeError, ValueError):
         low_battery_threshold_int = DEFAULT_LOW_BATTERY_THRESHOLD_PERCENT
 
-    try:
-        blackout_delay_int = int(focus_overlay_blackout_delay_seconds)
-    except (TypeError, ValueError):
-        blackout_delay_int = DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
+    normalized_timeout = MANDATORY_LOCK_IDLE_TIMEOUT_SECONDS
+    normalized_blackout_delay = DEFAULT_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS
 
     settings = AppSettings(
-        idle_timeout_seconds=max(MIN_IDLE_TIMEOUT_SECONDS, min(timeout_int, MAX_IDLE_TIMEOUT_SECONDS)),
+        idle_timeout_seconds=max(MIN_IDLE_TIMEOUT_SECONDS, min(normalized_timeout, MAX_IDLE_TIMEOUT_SECONDS)),
         poll_interval_seconds=max(MIN_POLL_INTERVAL_SECONDS, min(poll_float, MAX_POLL_INTERVAL_SECONDS)),
         max_awake_session_hours=max(
             MIN_MAX_AWAKE_SESSION_HOURS,
@@ -160,12 +154,27 @@ def load_settings() -> AppSettings:
         auto_focus_overlay_on_idle=bool(auto_focus_overlay_on_idle),
         focus_overlay_blackout_delay_seconds=max(
             MIN_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS,
-            min(blackout_delay_int, MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS),
+            min(normalized_blackout_delay, MAX_FOCUS_OVERLAY_BLACKOUT_DELAY_SECONDS),
         ),
         onboarding_completed=bool(onboarding_completed),
     )
 
-    if needs_save:
+    raw_focus_blackout = raw.get(
+        "focus_overlay_blackout_delay_seconds",
+        settings.focus_overlay_blackout_delay_seconds,
+    )
+    try:
+        raw_focus_blackout_int = int(raw_focus_blackout)
+    except (TypeError, ValueError):
+        raw_focus_blackout_int = settings.focus_overlay_blackout_delay_seconds
+
+    if (
+        needs_save
+        or timeout_int != settings.idle_timeout_seconds
+        or bool(raw.get("auto_focus_overlay_on_idle", DEFAULT_AUTO_FOCUS_OVERLAY_ON_IDLE))
+        != settings.auto_focus_overlay_on_idle
+        or raw_focus_blackout_int != settings.focus_overlay_blackout_delay_seconds
+    ):
         save_settings(settings)
 
     return settings
